@@ -1,0 +1,183 @@
+name: Publicar Dataflow
+
+# Builds Dataflow for Windows, macOS and Linux and publishes the release in this public repository,
+# where GitHub Actions is free. The code is checked out from the PRIVATE repository Sebastian-vas/dataflow
+# with a read-only deploy key (secret DATAFLOW_CODE_KEY); only what is published anyway leaves it: the
+# installers and the source code of the released version (GPL-3.0, required by DbGate's license).
+#
+# Run it from the code repository with ./dataflow-release.sh (tags the version and starts this workflow),
+# or by hand: Actions → "Publicar Dataflow" → Run workflow, with the tag (e.g. dataflow-v1.0.2), which
+# must already exist in the code repository. "publicar: false" only builds (installers attached to the run).
+#
+# Only people with write access to this repository can start it (workflow_dispatch); pull requests from
+# forks can't, so the deploy key is never exposed to them.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Etiqueta del repositorio de código (p. ej. dataflow-v1.0.2)'
+        required: true
+      publicar:
+        description: 'Publicar la release (si no, solo compila)'
+        type: boolean
+        default: true
+
+concurrency:
+  group: dataflow-release
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CODE_REPOSITORY: Sebastian-vas/dataflow
+  TAG: ${{ inputs.tag }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - windows-2022
+          - ubuntu-22.04
+    steps:
+      - name: Version
+        shell: bash
+        run: |
+          case "$TAG" in dataflow-v[0-9]*) ;; *) echo "La etiqueta debe ser dataflow-vX.Y.Z"; exit 1;; esac
+          echo "VERSION=${TAG#dataflow-v}" >> $GITHUB_ENV
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m pip install --upgrade pip setuptools
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CODE_REPOSITORY }}
+          ref: ${{ env.TAG }}
+          ssh-key: ${{ secrets.DATAFLOW_CODE_KEY }}
+          persist-credentials: false
+          fetch-depth: 1
+      - name: Use Node.js 24.x
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24.x
+      - name: Set the version
+        shell: bash
+        run: node -e "const fs=require('fs');const j=JSON.parse(fs.readFileSync('package.json','utf8'));j.version=process.argv[1];fs.writeFileSync('package.json',JSON.stringify(j,null,2)+'\n')" "$VERSION"
+      - name: adjustPackageJson
+        run: node adjustPackageJson --community
+      - name: yarn install
+        run: |
+          yarn config set network-timeout 100000
+          yarn install
+      - name: setCurrentVersion
+        run: yarn setCurrentVersion
+      - name: fillPackagedPlugins
+        run: yarn fillPackagedPlugins
+      - name: Signing
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ] && [ -n "${{ secrets.MAC_CERTIFICATE }}" ]; then
+            echo "CSC_LINK=${{ secrets.MAC_CERTIFICATE }}" >> $GITHUB_ENV
+            echo "CSC_KEY_PASSWORD=${{ secrets.MAC_CERTIFICATE_PASSWORD }}" >> $GITHUB_ENV
+          elif [ "${{ runner.os }}" = "Windows" ] && [ -n "${{ secrets.WIN_CERTIFICATE }}" ]; then
+            echo "CSC_LINK=${{ secrets.WIN_CERTIFICATE }}" >> $GITHUB_ENV
+            echo "CSC_KEY_PASSWORD=${{ secrets.WIN_CERTIFICATE_PASSWORD }}" >> $GITHUB_ENV
+          else
+            echo "CSC_IDENTITY_AUTO_DISCOVERY=false" >> $GITHUB_ENV
+          fi
+      - name: Build installers
+        shell: bash
+        run: yarn run build:app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      - name: Collect installers
+        shell: bash
+        run: |
+          mkdir artifacts
+          for ext in exe zip dmg AppImage deb tar.gz blockmap yml; do mv app/dist/*.$ext artifacts/ 2>/dev/null || true; done
+          rm -f artifacts/builder-debug.yml artifacts/builder-effective-config.yaml
+          ls -la artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dataflow-${{ matrix.os }}
+          path: artifacts
+          if-no-files-found: error
+
+  publish:
+    name: Publicar la release
+    needs: build
+    if: inputs.publicar
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Version
+        run: echo "VERSION=${TAG#dataflow-v}" >> $GITHUB_ENV
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.CODE_REPOSITORY }}
+          ref: ${{ env.TAG }}
+          ssh-key: ${{ secrets.DATAFLOW_CODE_KEY }}
+          persist-credentials: false
+          fetch-depth: 0
+          path: code
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Source code of this version (GPL-3.0)
+        working-directory: code
+        run: git archive --format=tar.gz --prefix="dataflow-${VERSION}/" -o "../artifacts/dataflow-${VERSION}-codigo-fuente.tar.gz" "${TAG}"
+      - name: Checksums
+        working-directory: artifacts
+        run: sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - name: Release notes
+        working-directory: code
+        run: |
+          previous=$(git describe --tags --abbrev=0 --match 'dataflow-v*' "${TAG}^" 2>/dev/null || true)
+          {
+            echo "## Novedades"
+            echo
+            if [ -n "$previous" ]; then
+              git log --no-merges --format='- %s' "${previous}..${TAG}" | sed 's/ \[skip ci\]//'
+            else
+              echo "- Primera versión de Dataflow."
+            fi
+            cat <<'NOTES'
+
+          ## Instaladores
+
+          | Sistema | Archivo |
+          |---|---|
+          | Windows | `dataflow-*-win_x64.exe` (arm64: `win_arm64.exe`). Si SmartScreen avisa: «Más información» → «Ejecutar de todas formas» |
+          | macOS | `dataflow-*-mac_universal.dmg` (o `mac_arm64` / `mac_x64`) |
+          | Linux (Debian/Ubuntu/Mint) | `.deb`: `sudo apt install ./dataflow-*-linux_amd64.deb` |
+          | Linux (cualquiera) | `.AppImage` (se actualiza sola) |
+
+          **macOS sin firmar:** abre la app con clic derecho → *Abrir* la primera vez, o ejecuta
+          `xattr -cr /Applications/Dataflow.app`.
+
+          Las apps instaladas se actualizan solas desde aquí (Ajustes → General → Actualización automática).
+
+          Dataflow se basa en [DbGate Community](https://github.com/dbgate/dbgate) (GPL-3.0). El código fuente
+          de esta versión está en `dataflow-*-codigo-fuente.tar.gz`.
+          NOTES
+          } | sed 's/^          //' > ../notes.md
+          cat ../notes.md
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: Dataflow ${{ env.VERSION }}
+          body_path: notes.md
+          files: artifacts/*
+          fail_on_unmatched_files: true
